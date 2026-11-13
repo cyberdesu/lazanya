@@ -5,6 +5,8 @@ import logging
 import sys
 import traceback
 
+from concurrent.futures import ThreadPoolExecutor
+
 from lazagne.config.change_privileges import list_sids, rev2self, impersonate_sid_long_handle
 from lazagne.config.users import get_user_list_on_filesystem, set_env_variables, get_username_winapi
 from lazagne.config.dpapi_structure import SystemDpapi, are_masterkeys_retrieved
@@ -53,12 +55,39 @@ def run_module(title, module):
         yield False, title.capitalize(), error_message
 
 
+def _run_module_collect(title, module):
+    """
+    Run one module without printing. Safe to call from a worker thread:
+    modules only read shared state during run(); all writes happen in the
+    serial _emit_module_result() step on the main thread.
+    """
+    try:
+        return True, title.capitalize(), module.run()
+    except Exception:
+        return False, title.capitalize(), traceback.format_exc()
+
+
+def _emit_module_result(result):
+    """
+    Serial output step for a collected module result. Runs on the main thread
+    so output ordering and shared-state writes (constant.finalResults,
+    nb_password_found, password_found) stay race-free.
+    """
+    ok, title, data = result
+    constant.st.title_info(title)
+    if ok:
+        constant.st.print_output(title, data)
+    else:
+        print_debug('DEBUG', data)
+    return result
+
+
 def run_modules(module, subcategories={}, system_module=False):
     """
     Run modules inside a category (could be one or multiple modules)
     """
     modules_to_launch = []
-    
+
     # Launch only a specific module
     for i in subcategories:
         if subcategories[i] and i in module:
@@ -68,6 +97,8 @@ def run_modules(module, subcategories={}, system_module=False):
     if not modules_to_launch:
         modules_to_launch = module
 
+    # Select modules to run now (defer winapi/dpapi ones to the end)
+    to_run_now = []
     for i in modules_to_launch:
         # Only current user could access to HKCU registry or use some API that only can be run from the user environment
         if not constant.is_current_user:
@@ -91,9 +122,29 @@ def run_modules(module, subcategories={}, system_module=False):
             })
             continue
 
-        # Run module
-        for m in run_module(title=i, module=module[i]):
-            yield m
+        to_run_now.append(i)
+
+    # Parallelize only when safe:
+    # - not system modules (heavy crypto on dumped hives, kept serial)
+    # - not while a thread-local impersonation token is active (per-thread token)
+    # - not in verbose mode (keeps -v debug output readable / ordered)
+    parallel = (
+        len(to_run_now) > 1
+        and not system_module
+        and not constant.impersonating
+        and not logging.getLogger().isEnabledFor(logging.INFO)
+    )
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=constant.n_threads) as executor:
+            # executor.map preserves input order -> deterministic, grouped output
+            results = list(executor.map(lambda i: _run_module_collect(i, module[i]), to_run_now))
+        for res in results:
+            yield _emit_module_result(res)
+    else:
+        for i in to_run_now:
+            for m in run_module(title=i, module=module[i]):
+                yield m
 
 
 def run_category(category_selected, subcategories={}, system_module=False):
@@ -212,6 +263,9 @@ def run_lazagne(category_selected='all', subcategories={}, password=None):
             if constant.username != sid[3] and sid[2] != 'S-1-5-18':
                 impersonate_users.setdefault(sid[3], []).append(sid[2])
 
+        # Impersonation uses a per-thread token (SetThreadToken/ImpersonateLoggedOnUser),
+        # so module execution must stay on this thread -> disable parallelism here.
+        constant.impersonating = True
         for user in impersonate_users:
             if 'service' in user.lower().strip():
                 continue
@@ -239,6 +293,7 @@ def run_lazagne(category_selected='all', subcategories={}, password=None):
                         break
                 except Exception:
                     print_debug('DEBUG', traceback.format_exc())
+        constant.impersonating = False
 
         # --------- Impersonation browsing file system ---------
 

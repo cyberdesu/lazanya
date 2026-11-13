@@ -59,3 +59,7 @@ class constant():
         "dpapi": [],
     }
     dpapi_cache = {}
+    # True only while a thread-local impersonation token is active (not thread-safe to parallelize)
+    impersonating = False
+    # Worker threads for parallel module execution (modules are I/O-bound: filesystem + registry reads)
+    n_threads = min(32, (os.cpu_count() or 4) * 4)
